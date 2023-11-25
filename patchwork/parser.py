@@ -5,6 +5,7 @@
 
 import codecs
 import datetime
+import os
 from email.header import decode_header
 from email.header import make_header
 from email.utils import mktime_tz
@@ -41,7 +42,7 @@ list_id_headers = ['List-ID', 'X-Mailing-List', 'X-list']
 #
 # Only used when there are not proper references to determine the series
 # (such as when the mail is not threaded)
-SERIES_DELAY_INTERVAL = 20
+SERIES_DELAY_INTERVAL = 90
 
 # @see https://git-scm.com/docs/git-diff#_generating_patches_with_p
 EXTENDED_HEADER_LINES = (
@@ -160,13 +161,33 @@ def find_project_by_id_and_subject(list_id, subject):
     """
     projects = Project.objects.filter(listid=list_id)
     default = None
+
+    # check patch email like [PATCH branch 1/x] or [PATCH branch]
+    if not subject.startswith("[PATCH"):
+        # if subject like this [master 1/3] or [master], return NoneType project
+        return default
+
+    subject_x = subject.split("]")[0].split("[")[1]
+    if subject_x.count(" ") >= 2:
+        v = re.compile(r'v\d+', re.IGNORECASE)
+        # match situation like this [PATCH master ...] or [PATCH master v2 ...] or [PATCH v2 master ...] or [PATCH master V2 ...] or [PATCH V2 master ...]
+        if v.match(subject_x.split(" ")[1]):
+            subject_x = subject_x.split(" ")[2]
+        elif v.match(subject_x.split(" ")[2]):
+            subject_x = subject_x.split(" ")[1]
+        else:
+            subject_x = subject_x.split(" ")[1]
+    else:
+        # match [PATCH master]
+        subject_x = subject_x.split(" ")[-1]
     for project in projects:
         if not project.subject_match:
             default = project
         elif re.search(
             project.subject_match, subject, re.MULTILINE | re.IGNORECASE
         ):
-            return project
+            if re.search(project.subject_match, subject, re.MULTILINE | re.IGNORECASE)[1] == subject_x:
+                return project
 
     return default
 
@@ -1105,6 +1126,28 @@ def find_comment_addressed_by_header(mail):
     return False if 'X-Patchwork-Action-Required' in mail else None
 
 
+def getinfo(id):
+    """Get project, series and patch info from series id"""
+    if not id:
+        raise ValueError("Missing id")
+
+    series = Series.objects.filter(id=id)
+    if len(series) != 1:
+        raise ValueError(f"found {len(series)} id")
+
+    s = series.first()
+    project = Project.objects.filter(id=s.project_id)
+
+    if len(project) != 1:
+        raise ValueError(f"found {len(project)} project")
+
+    pro = project.first()
+    patches = Patch.objects.filter(series_id=s.id)
+    for p in patches:
+        print(pro.listid + ":" + pro.name + ":" + str(id) + ":" + p.name)
+        break
+
+
 def parse_mail(mail, list_id=None):
     """Parse a mail and add to the database.
 
@@ -1223,6 +1266,13 @@ def parse_mail(mail, list_id=None):
                                 series = None
                         elif len(series) == 1:
                             series = series.first()
+                            if not series.name:
+                                patches = Patch.objects.filter(series=series)
+                                for p in patches:
+                                    write_project_series_dict_to_file(list_id, project.name, series.id, p.name)
+                                    break
+                            else:
+                                write_project_series_dict_to_file(list_id, project.name, series.id, series.name)
                     else:
                         x = n = 1
 
@@ -1243,6 +1293,13 @@ def parse_mail(mail, list_id=None):
                             version=version,
                             total=n,
                         )
+                        if not series.name:
+                            patches = Patch.objects.filter(series=series)
+                            for p in patches:
+                                write_project_series_dict_to_file(list_id, project.name, series.id, p.name)
+                                break
+                        else:
+                            write_project_series_dict_to_file(list_id, project.name, series.id, series.name)
 
                         # NOTE(stephenfin) We must save references for series.
                         # We do this to handle the case where a later patch is
@@ -1303,6 +1360,10 @@ def parse_mail(mail, list_id=None):
             # TODO(stephenfin): Remove 'series' from the conditional as we will
             # always have a series
             series.add_patch(patch, x)
+            patches = Patch.objects.filter(series=series, number=x)
+            for p in patches:
+                write_project_series_dict_to_file(list_id, project.name, series.id, p.name)
+                break
 
         return patch
     elif x == 0:  # (potential) cover letters
@@ -1346,6 +1407,14 @@ def parse_mail(mail, list_id=None):
                     total=n,
                 )
 
+                if not series.name:
+                    patches = Patch.objects.filter(series=series)
+                    for p in patches:
+                        write_project_series_dict_to_file(list_id, project.name, series.id, p.name)
+                        break
+                else:
+                    write_project_series_dict_to_file(list_id, project.name, series.id, series.name)
+
                 # we don't save the in-reply-to or references fields
                 # for a cover letter, as they can't refer to the same
                 # series
@@ -1366,6 +1435,8 @@ def parse_mail(mail, list_id=None):
                     submitter=author,
                     content=message,
                 )
+
+            write_project_series_dict_to_file(list_id, project.name, series.id, name)
 
             logger.debug('Cover letter saved')
 
@@ -1419,6 +1490,24 @@ def parse_mail(mail, list_id=None):
     logger.debug('Comment saved')
 
     return comment
+
+
+def write_project_series_dict_to_file(l_id, prj, ser_id, ser_name):
+    if l_id is not None and prj is not None and ser_id is not None and ser_name is not None:
+        string = l_id + ":" + prj + ":" + str(ser_id) + ":" + ser_name + "\n"
+    else:
+        return
+
+    import os
+    if os.path.exists("/home/patches/project_series.txt"):
+        with open("/home/patches/project_series.txt", "r", encoding="utf-8") as ff:
+            data = ff.readlines()
+
+            for i in data:
+                if str(ser_id) in i:
+                    return
+    with open("/home/patches/project_series.txt", "a", encoding="utf-8") as f:
+        f.writelines(string)
 
 
 def find_filenames(diff):
