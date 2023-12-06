@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim-gtk \
     sudo \
     wget \
+    less \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 RUN usermod -s /bin/bash patchwork && \
